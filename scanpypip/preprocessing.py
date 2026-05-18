@@ -30,7 +30,7 @@ def read_sc_file(file_path,header=0,index_col=0,sep=None):
         The load data. 
     '''
     filename = file_path
-    separators = ["\t","\n"," ",","] 
+    separators = ["\t"," ",","] 
 
     # Read first line to select a right seperator
     def try_seperators(filename, header, index_col, seps):

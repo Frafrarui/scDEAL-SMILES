@@ -888,3 +888,244 @@ def train_DaNN_model2(net,source_loader,target_loader,
         torch.save(net.state_dict(), save_path)
 
     return net, loss_train,mmd_train,sc_train    
+
+
+# ============================================================================
+# SMILES-aware trainers for multi-drug pipeline
+# ============================================================================
+
+def train_predictor_model_smiles(net, data_loaders, optimizer, loss_function,
+                                  n_epochs, scheduler, load=False,
+                                  save_path="model.pkl", device=None):
+    """
+    Train predictor model with SMILES drug tokens.
+    
+    Each batch contains 3 elements: (x_gene, x_drug, y_label)
+    instead of the original 2 elements: (x_gene, y_label).
+    
+    The model receives (x_gene, x_drug) and outputs predictions.
+    """
+    if load != False:
+        if os.path.exists(save_path):
+            net.load_state_dict(torch.load(save_path))
+            return net, 0
+        else:
+            logging.warning("Failed to load existing file, proceed to the training process.")
+    
+    dataset_sizes = {x: data_loaders[x].dataset.tensors[0].shape[0] for x in ['train', 'val']}
+    loss_train = {}
+    
+    best_model_wts = copy.deepcopy(net.state_dict())
+    best_loss = np.inf
+    
+    for epoch in range(n_epochs):
+        logging.info('Epoch {}/{}'.format(epoch, n_epochs - 1))
+        logging.info('-' * 10)
+        
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                net.train()
+            else:
+                net.eval()
+            
+            running_loss = 0.0
+            n_iters = len(data_loaders[phase])
+            
+            for batchidx, (x_gene, x_drug, y) in enumerate(data_loaders[phase]):
+                # Move batch to device (data may live on CPU for memory efficiency)
+                if device is not None:
+                    x_gene = x_gene.to(device)
+                    x_drug = x_drug.to(device)
+                    y = y.to(device)
+                x_gene.requires_grad_(True)
+                
+                # Forward pass with gene expression + drug tokens
+                output = net(x_gene, x_drug)
+                loss = loss_function(output, y)
+                
+                optimizer.zero_grad()
+                if phase == 'train':
+                    loss.backward()
+                    optimizer.step()
+                
+                running_loss += loss.item()
+            
+            epoch_loss = running_loss / n_iters
+            if phase == 'train':
+                scheduler.step(epoch_loss)
+            
+            last_lr = scheduler.optimizer.param_groups[0]['lr']
+            loss_train[epoch, phase] = epoch_loss
+            logging.info('{} Loss: {:.8f}. Learning rate = {}'.format(phase, epoch_loss, last_lr))
+            
+            if phase == 'val' and epoch_loss < best_loss:
+                best_loss = epoch_loss
+                best_model_wts = copy.deepcopy(net.state_dict())
+        
+        # Print progress every 50 epochs
+        if epoch % 50 == 0 or epoch == n_epochs - 1:
+            print(f"  Epoch {epoch}/{n_epochs-1} - train: {loss_train.get((epoch,'train'), 'N/A'):.6f}, val: {loss_train.get((epoch,'val'), 'N/A'):.6f}")
+    
+    torch.save(best_model_wts, save_path)
+    net.load_state_dict(best_model_wts)
+    
+    return net, loss_train
+
+
+def train_DaNN_model_smiles(net, source_loader, target_loader,
+                             optimizer, loss_function, n_epochs, scheduler,
+                             dist_loss, weight=0.25, GAMMA=1000, epoch_tail=0.90,
+                             load=False, save_path="save/model.pkl",
+                             best_model_cache="drive", top_models=5,
+                             k=10, device="cuda"):
+    """
+    Train DaNN model with SMILES drug tokens.
+    
+    Key difference from train_DaNN_model2:
+      - source_loader batches are (x_gene, x_drug, y_label) with 3 elements
+      - target_loader batches remain (x_target, y_cluster) with 2 elements
+      - DaNNWithDrug.forward(x_src, x_tar, drug_tokens) is called
+    
+    Loss = classification_loss + weight * mmd_loss + cluster_regularization
+    """
+    if load != False:
+        if os.path.exists(save_path):
+            try:
+                net.load_state_dict(torch.load(save_path))
+                return net, 0, 0, 0
+            except:
+                logging.warning("Failed to load existing file, proceed to the training process.")
+        else:
+            logging.warning("Failed to load existing file, proceed to the training process.")
+    
+    loss_train = {}
+    mmd_train = {}
+    sc_train = {}
+    best_model_wts = copy.deepcopy(net.state_dict())
+    best_loss = np.inf
+    
+    for epoch in range(n_epochs):
+        logging.info('Epoch {}/{}'.format(epoch, n_epochs - 1))
+        logging.info('-' * 10)
+        
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                net.train()
+            else:
+                net.eval()
+            
+            running_loss = 0.0
+            running_mmd = 0.0
+            running_sc = 0.0
+            
+            batch_j = 0
+            list_src = list(enumerate(source_loader[phase]))
+            list_tar = list(enumerate(target_loader[phase]))
+            n_iters = max(len(source_loader[phase]), len(target_loader[phase]))
+            
+            for batchidx, (x_src, x_drug_src, y_src) in enumerate(source_loader[phase]):
+                _, (x_tar, y_tar) = list_tar[batch_j]
+                
+                # Move batch to device (data may live on CPU for memory efficiency)
+                if device is not None:
+                    x_src = x_src.to(device)
+                    x_drug_src = x_drug_src.to(device)
+                    y_src = y_src.to(device)
+                    x_tar = x_tar.to(device)
+                    y_tar = y_tar.to(device)
+                
+                x_tar.requires_grad_(True)
+                x_src.requires_grad_(True)
+                
+                min_size = min(x_src.shape[0], x_tar.shape[0])
+                
+                if x_src.shape[0] != x_tar.shape[0]:
+                    x_src = x_src[:min_size]
+                    x_drug_src = x_drug_src[:min_size]
+                    y_src = y_src[:min_size]
+                    x_tar = x_tar[:min_size]
+                    y_tar = y_tar[:min_size]
+                
+                # Forward pass with drug tokens
+                if net.target_model._get_name() == "CVAEBase":
+                    y_pre, x_src_mmd, x_tar_mmd = net(x_src, x_tar, x_drug_src, y_tar)
+                else:
+                    y_pre, x_src_mmd, x_tar_mmd = net(x_src, x_tar, x_drug_src)
+                
+                # Cluster regularization (same as train_DaNN_model2)
+                encoderrep = net.target_model.encoder(x_tar)
+                if encoderrep.shape[0] < k:
+                    batch_j += 1
+                    if batch_j >= len(list_tar):
+                        batch_j = 0
+                    continue
+                
+                edgeList = calculateKNNgraphDistanceMatrix(
+                    encoderrep.cpu().detach().numpy(), distanceType='euclidean', k=10)
+                listResult, size = generateLouvainCluster(edgeList)
+                
+                loss_s = 0
+                for i in range(size):
+                    s = cosine_similarity(
+                        x_tar[np.asarray(listResult) == i, :].cpu().detach().numpy())
+                    s = 1 - s
+                    loss_s += np.sum(np.triu(s, 1)) / ((s.shape[0] * s.shape[0]) * 2 - s.shape[0])
+                
+                if device == "cuda" or (isinstance(device, torch.device) and device.type == "cuda"):
+                    loss_s = torch.tensor(loss_s).cuda()
+                else:
+                    loss_s = torch.tensor(loss_s).cpu()
+                loss_s.requires_grad_(True)
+                
+                # Compute losses
+                loss_c = loss_function(y_pre, y_src)
+                loss_mmd = dist_loss(x_src_mmd, x_tar_mmd)
+                
+                loss = loss_c + weight * loss_mmd + loss_s
+                
+                optimizer.zero_grad()
+                if phase == 'train':
+                    loss.backward(retain_graph=True)
+                    optimizer.step()
+                
+                running_loss += loss.item()
+                running_mmd += loss_mmd.item()
+                running_sc += loss_s.item()
+                
+                batch_j += 1
+                if batch_j >= len(list_tar):
+                    batch_j = 0
+            
+            epoch_loss = running_loss / max(n_iters, 1)
+            epoch_mmd = running_mmd / max(n_iters, 1)
+            epoch_sc = running_sc / max(n_iters, 1)
+            
+            if phase == 'train':
+                scheduler.step(epoch_loss)
+            
+            last_lr = scheduler.optimizer.param_groups[0]['lr']
+            loss_train[epoch, phase] = epoch_loss
+            mmd_train[epoch, phase] = epoch_mmd
+            sc_train[epoch, phase] = epoch_sc
+            
+            logging.info('{} Loss: {:.8f}. Learning rate = {}'.format(phase, epoch_loss, last_lr))
+            
+            if (phase == 'val') and (epoch_loss < best_loss) and (epoch > (n_epochs * (1 - epoch_tail))):
+                best_loss = epoch_loss
+                if best_model_cache == "memory":
+                    best_model_wts = copy.deepcopy(net.state_dict())
+                else:
+                    torch.save(net.state_dict(), save_path + "_bestcahce.pkl")
+        
+        # Print progress every 50 epochs
+        if epoch % 50 == 0 or epoch == n_epochs - 1:
+            print(f"  Epoch {epoch}/{n_epochs-1} - loss: {epoch_loss:.6f}, mmd: {epoch_mmd:.6f}, sc: {epoch_sc:.6f}")
+    
+    if best_model_cache == "memory":
+        torch.save(best_model_wts, save_path)
+        net.load_state_dict(best_model_wts)
+    else:
+        net.load_state_dict((torch.load(save_path + "_bestcahce.pkl")))
+        torch.save(net.state_dict(), save_path)
+    
+    return net, loss_train, mmd_train, sc_train

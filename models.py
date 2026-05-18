@@ -667,3 +667,368 @@ def g_loss_function(preds, labels, mu, logvar, n_nodes, norm, pos_weight):
     KLD = -0.5 / n_nodes * torch.mean(torch.sum(
         1 + 2 * logvar - mu.pow(2) - logvar.exp().pow(2), 1))
     return cost + KLD
+
+
+# ============================================================================
+# SMILES-aware models for multi-drug prediction
+# ============================================================================
+
+class DrugEncoder(nn.Module):
+    """
+    Encodes SMILES token sequences into a fixed-size drug embedding.
+    
+    Architecture:
+      Embedding(vocab_size, embed_dim) 
+      → Flatten 
+      → Linear(embed_dim * max_len, h_dim) → ReLU → Dropout
+      → Linear(h_dim, drug_latent_dim)
+    
+    Input:  (batch, max_smiles_length) of LongTensor token indices
+    Output: (batch, drug_latent_dim) float embedding
+    """
+    def __init__(self, vocab_size, max_smiles_len, embed_dim=32, 
+                 h_dim=128, drug_latent_dim=32, drop_out=0.3):
+        super(DrugEncoder, self).__init__()
+        
+        self.max_smiles_len = max_smiles_len
+        self.drug_latent_dim = drug_latent_dim
+        
+        # Character embedding (index 0 = padding)
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        
+        # MLP to compress flattened embeddings
+        flat_dim = embed_dim * max_smiles_len
+        self.fc = nn.Sequential(
+            nn.Linear(flat_dim, h_dim),
+            nn.ReLU(),
+            nn.Dropout(drop_out),
+            nn.Linear(h_dim, drug_latent_dim)
+        )
+    
+    def forward(self, tokens):
+        """
+        Args:
+            tokens: LongTensor of shape (batch, max_smiles_len)
+        Returns:
+            drug_embedding: FloatTensor of shape (batch, drug_latent_dim)
+        """
+        # (batch, max_len) → (batch, max_len, embed_dim)
+        x = self.embedding(tokens)
+        # (batch, max_len, embed_dim) → (batch, max_len * embed_dim)
+        x = x.view(x.size(0), -1)
+        # (batch, flat_dim) → (batch, drug_latent_dim)
+        drug_embedding = self.fc(x)
+        return drug_embedding
+
+
+class PredictorWithDrug(nn.Module):
+    """
+    MLP predictor that takes concatenated [gene_embedding, drug_embedding] as input.
+    Same architecture as Predictor, but with input_dim = gene_latent_dim + drug_latent_dim.
+    
+    Input:  gene_embedding  (batch, gene_latent_dim)
+            drug_embedding  (batch, drug_latent_dim)
+    Output: prediction      (batch, output_dim)  with Sigmoid
+    """
+    def __init__(self, gene_latent_dim, drug_latent_dim, output_dim=2,
+                 h_dims=[128, 64], drop_out=0.3):
+        super(PredictorWithDrug, self).__init__()
+        
+        self.gene_latent_dim = gene_latent_dim
+        self.drug_latent_dim = drug_latent_dim
+        combined_dim = gene_latent_dim + drug_latent_dim
+        
+        modules = []
+        hidden_dims = deepcopy(h_dims)
+        hidden_dims.insert(0, combined_dim)
+        
+        for i in range(1, len(hidden_dims)):
+            i_dim = hidden_dims[i-1]
+            o_dim = hidden_dims[i]
+            modules.append(
+                nn.Sequential(
+                    nn.Linear(i_dim, o_dim),
+                    nn.BatchNorm1d(o_dim),
+                    nn.ReLU(),
+                    nn.Dropout(drop_out))
+            )
+        
+        self.predictor = nn.Sequential(*modules)
+        self.output = nn.Sequential(
+            nn.Linear(hidden_dims[-1], output_dim),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, gene_emb, drug_emb, **kwargs):
+        """
+        Args:
+            gene_emb: (batch, gene_latent_dim)
+            drug_emb: (batch, drug_latent_dim)
+        """
+        combined = torch.cat([gene_emb, drug_emb], dim=1)
+        h = self.predictor(combined)
+        return self.output(h)
+
+
+class PretrainedPredictorWithDrug(AEBase):
+    """
+    Combines:
+      1. Pre-trained AEBase encoder (for gene expression)
+      2. DrugEncoder (for SMILES tokens)
+      3. PredictorWithDrug (for combined prediction)
+    
+    forward(x_gene, x_drug):
+      gene_emb = encode(x_gene)           → (batch, latent_dim)
+      drug_emb = drug_encoder(x_drug)     → (batch, drug_latent_dim)
+      output   = predictor(gene_emb, drug_emb) → (batch, output_dim)
+    """
+    def __init__(self,
+                 # AE params
+                 input_dim, latent_dim=128, h_dims=[512], drop_out=0.3,
+                 pretrained_weights=None, freezed=False,
+                 # Drug encoder params
+                 vocab_size=36, max_smiles_len=272, drug_embed_dim=32,
+                 drug_h_dim=128, drug_latent_dim=32, drug_drop_out=0.3,
+                 # Predictor params
+                 hidden_dims_predictor=[128, 64], drop_out_predictor=0.3,
+                 output_dim=2):
+        
+        # Build AE encoder
+        AEBase.__init__(self, input_dim, latent_dim, h_dims, drop_out)
+        
+        # Load pretrained AE weights
+        if pretrained_weights is not None:
+            self.load_state_dict(torch.load(pretrained_weights))
+        
+        # Freeze encoder if requested
+        if freezed:
+            bottleneck_reached = False
+            for p in self.parameters():
+                if bottleneck_reached and p.shape.numel() > self.latent_dim:
+                    break
+                p.requires_grad = False
+                if p.shape.numel() == self.latent_dim:
+                    bottleneck_reached = True
+        
+        # Remove decoder (only need encoder)
+        del self.decoder
+        del self.decoder_input
+        del self.final_layer
+        
+        # Drug encoder
+        self.drug_encoder = DrugEncoder(
+            vocab_size=vocab_size,
+            max_smiles_len=max_smiles_len,
+            embed_dim=drug_embed_dim,
+            h_dim=drug_h_dim,
+            drug_latent_dim=drug_latent_dim,
+            drop_out=drug_drop_out
+        )
+        
+        # Combined predictor
+        self.predictor = PredictorWithDrug(
+            gene_latent_dim=latent_dim,
+            drug_latent_dim=drug_latent_dim,
+            output_dim=output_dim,
+            h_dims=hidden_dims_predictor,
+            drop_out=drop_out_predictor
+        )
+    
+    def forward(self, x_gene, x_drug, **kwargs):
+        """
+        Args:
+            x_gene: FloatTensor (batch, input_dim) - gene expression
+            x_drug: LongTensor (batch, max_smiles_len) - SMILES tokens
+        Returns:
+            output: (batch, output_dim) - prediction probabilities
+        """
+        gene_emb = self.encode(x_gene)
+        drug_emb = self.drug_encoder(x_drug)
+        output = self.predictor(gene_emb, drug_emb)
+        return output
+    
+    def predict(self, gene_embedding, drug_embedding, **kwargs):
+        """Predict from pre-computed embeddings."""
+        output = self.predictor(gene_embedding, drug_embedding)
+        return output
+
+
+class DaNNWithDrug(nn.Module):
+    """
+    Domain Adaptation Neural Network with Drug (SMILES) support.
+    
+    Extends DaNN to pass drug tokens through the source model's drug encoder
+    for classification, while MMD operates only on gene embeddings.
+    
+    forward(X_source, X_target, drug_tokens):
+      x_src_mmd = source_model.encode(X_source)      → gene emb (bulk)
+      x_tar_mmd = target_model.encode(X_target)       → gene emb (SC)
+      drug_emb  = source_model.drug_encoder(drug_tokens)
+      y_src     = source_model.predictor(x_src_mmd, drug_emb)
+      return y_src, x_src_mmd, x_tar_mmd
+    """
+    def __init__(self, source_model, target_model, fix_source=False):
+        super(DaNNWithDrug, self).__init__()
+        self.source_model = source_model
+        if fix_source:
+            for p in self.source_model.parameters():
+                p.requires_grad = False
+        self.target_model = target_model
+    
+    def forward(self, X_source, X_target, drug_tokens, C_target=None):
+        """
+        Args:
+            X_source:    FloatTensor (batch_src, n_genes_bulk)
+            X_target:    FloatTensor (batch_tar, n_genes_sc)
+            drug_tokens: LongTensor (batch_src, max_smiles_len) - SMILES for each source sample
+            C_target:    Optional condition labels for CVAE
+        Returns:
+            y_src:     (batch_src, output_dim) classification output
+            x_src_mmd: (batch_src, latent_dim) bulk gene embedding
+            x_tar_mmd: (batch_tar, latent_dim) SC gene embedding
+        """
+        # Encode gene expressions
+        x_src_mmd = self.source_model.encode(X_source)
+        
+        if C_target is not None:
+            x_tar_mmd = self.target_model.encode(X_target, C_target)
+        else:
+            x_tar_mmd = self.target_model.encode(X_target)
+        
+        # Encode drug and predict
+        drug_emb = self.source_model.drug_encoder(drug_tokens)
+        y_src = self.source_model.predictor(x_src_mmd, drug_emb)
+        
+        return y_src, x_src_mmd, x_tar_mmd
+
+
+class TargetModelWithDrug(nn.Module):
+    """
+    For prediction on single-cell data with any drug.
+    Uses the SC encoder + source model's drug encoder + predictor.
+    
+    forward(X_target, drug_tokens):
+      gene_emb = target_encoder.encode(X_target)
+      drug_emb = source_predictor.drug_encoder(drug_tokens)
+      y = source_predictor.predictor(gene_emb, drug_emb)
+    """
+    def __init__(self, source_predictor, target_encoder):
+        super(TargetModelWithDrug, self).__init__()
+        self.source_predictor = source_predictor
+        self.target_encoder = target_encoder
+    
+    def forward(self, X_target, drug_tokens, C_target=None):
+        """
+        Args:
+            X_target:    FloatTensor (batch, n_genes_sc)
+            drug_tokens: LongTensor (batch, max_smiles_len)
+            C_target:    Optional condition labels
+        """
+        if C_target is not None:
+            gene_emb = self.target_encoder.encode(X_target, C_target)
+        else:
+            gene_emb = self.target_encoder.encode(X_target)
+        
+        drug_emb = self.source_predictor.drug_encoder(drug_tokens)
+        y = self.source_predictor.predictor(gene_emb, drug_emb)
+        return y
+
+
+# ============================================================================
+# Sanity check for all SMILES models
+# ============================================================================
+
+if __name__ == '__main__':
+    print("=" * 70)
+    print("SANITY CHECK: models.py (SMILES-aware classes)")
+    print("=" * 70)
+    
+    device = 'cpu'
+    batch_size = 16
+    
+    # Dimensions matching real data
+    n_genes = 2000       # typical HVG count
+    latent_dim = 32      # bottleneck
+    vocab_size = 36      # from smiles_encoder
+    max_smiles_len = 272 # from smiles_encoder
+    drug_latent_dim = 32
+    output_dim = 2       # binary classification
+    
+    # Dummy tensors
+    x_gene = torch.randn(batch_size, n_genes).to(device)
+    x_drug = torch.randint(0, vocab_size, (batch_size, max_smiles_len)).to(device)
+    
+    print(f"\nInput shapes:")
+    print(f"  x_gene:  {x_gene.shape}  (batch, n_genes)")
+    print(f"  x_drug:  {x_drug.shape}  (batch, max_smiles_len)")
+    
+    # --- Test DrugEncoder ---
+    print(f"\n--- DrugEncoder ---")
+    drug_enc = DrugEncoder(vocab_size=vocab_size, max_smiles_len=max_smiles_len,
+                           embed_dim=32, h_dim=128, drug_latent_dim=drug_latent_dim).to(device)
+    drug_emb = drug_enc(x_drug)
+    print(f"  Output shape: {drug_emb.shape}  (expected: [{batch_size}, {drug_latent_dim}])")
+    assert drug_emb.shape == (batch_size, drug_latent_dim), "❌ Shape mismatch!"
+    print(f"  ✅ DrugEncoder OK")
+    
+    # --- Test PredictorWithDrug ---
+    print(f"\n--- PredictorWithDrug ---")
+    gene_emb_dummy = torch.randn(batch_size, latent_dim).to(device)
+    pred_drug = PredictorWithDrug(gene_latent_dim=latent_dim, drug_latent_dim=drug_latent_dim,
+                                   output_dim=output_dim, h_dims=[128, 64]).to(device)
+    pred_out = pred_drug(gene_emb_dummy, drug_emb)
+    print(f"  Output shape: {pred_out.shape}  (expected: [{batch_size}, {output_dim}])")
+    assert pred_out.shape == (batch_size, output_dim), "❌ Shape mismatch!"
+    print(f"  ✅ PredictorWithDrug OK")
+    
+    # --- Test PretrainedPredictorWithDrug ---
+    print(f"\n--- PretrainedPredictorWithDrug ---")
+    model = PretrainedPredictorWithDrug(
+        input_dim=n_genes, latent_dim=latent_dim, h_dims=[512, 256], drop_out=0.3,
+        vocab_size=vocab_size, max_smiles_len=max_smiles_len,
+        drug_latent_dim=drug_latent_dim,
+        hidden_dims_predictor=[128, 64], output_dim=output_dim
+    ).to(device)
+    
+    out = model(x_gene, x_drug)
+    print(f"  Output shape: {out.shape}  (expected: [{batch_size}, {output_dim}])")
+    assert out.shape == (batch_size, output_dim), "❌ Shape mismatch!"
+    
+    # Test encode + predict separately
+    gene_emb_test = model.encode(x_gene)
+    drug_emb_test = model.drug_encoder(x_drug)
+    out_sep = model.predict(gene_emb_test, drug_emb_test)
+    print(f"  Separate encode+predict: {out_sep.shape}")
+    assert out_sep.shape == (batch_size, output_dim), "❌ Shape mismatch!"
+    print(f"  ✅ PretrainedPredictorWithDrug OK")
+    
+    # --- Test DaNNWithDrug ---
+    print(f"\n--- DaNNWithDrug ---")
+    n_genes_sc = 1500  # SC may have different gene count
+    x_target = torch.randn(batch_size, n_genes_sc).to(device)
+    
+    target_encoder = AEBase(input_dim=n_genes_sc, latent_dim=latent_dim,
+                            h_dims=[512, 256]).to(device)
+    
+    dann_model = DaNNWithDrug(source_model=model, target_model=target_encoder).to(device)
+    y_src, x_src_mmd, x_tar_mmd = dann_model(x_gene, x_target, x_drug)
+    
+    print(f"  y_src shape:     {y_src.shape}      (expected: [{batch_size}, {output_dim}])")
+    print(f"  x_src_mmd shape: {x_src_mmd.shape}  (expected: [{batch_size}, {latent_dim}])")
+    print(f"  x_tar_mmd shape: {x_tar_mmd.shape}  (expected: [{batch_size}, {latent_dim}])")
+    assert y_src.shape == (batch_size, output_dim)
+    assert x_src_mmd.shape == (batch_size, latent_dim)
+    assert x_tar_mmd.shape == (batch_size, latent_dim)
+    print(f"  ✅ DaNNWithDrug OK")
+    
+    # --- Test TargetModelWithDrug ---
+    print(f"\n--- TargetModelWithDrug ---")
+    target_pred = TargetModelWithDrug(source_predictor=model, target_encoder=target_encoder).to(device)
+    y_pred = target_pred(x_target, x_drug)
+    print(f"  Output shape: {y_pred.shape}  (expected: [{batch_size}, {output_dim}])")
+    assert y_pred.shape == (batch_size, output_dim)
+    print(f"  ✅ TargetModelWithDrug OK")
+    
+    print(f"\n{'=' * 70}")
+    print(f"✅ ALL SANITY CHECKS PASSED")
+    print(f"{'=' * 70}")
